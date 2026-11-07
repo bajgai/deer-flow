@@ -37,6 +37,7 @@ Consequences worth keeping in mind when editing:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import math
@@ -44,6 +45,7 @@ import re
 import time
 from collections.abc import AsyncIterable, Callable, Iterable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
 
@@ -290,8 +292,7 @@ class TypeSafeClient:
             async with asyncio.timeout(self._connection.deadline_seconds):
                 deadline_at = time.monotonic() + self._connection.deadline_seconds
                 transport = None if self._transport_factory is None else self._transport_factory()
-                # Client construction loads TLS trust synchronously; keep it off the loop.
-                async with await asyncio.to_thread(httpx.AsyncClient, timeout=self._connection.timeout, transport=transport) as client:
+                async with await _open_async_client(timeout=self._connection.timeout, transport=transport) as client:
                     for attempt in range(1, self._connection.max_attempts + 1):
                         self._check_budget(deadline_at)
                         try:
@@ -425,6 +426,44 @@ class TypeSafeClient:
 
     async def _async_sleep_before_retry(self, attempt: int, deadline_at: float) -> None:
         await asyncio.sleep(min(self._connection.retry_backoff * 2 ** (attempt - 1), self._remaining(deadline_at)))
+
+
+async def _settle(future: asyncio.Future[Any]) -> Any:
+    """Await a future that owns a resource, even if this task is cancelled again.
+
+    Cleanup must not be the thing that gets abandoned: the caller remembers its
+    own cancellation and re-raises it once the resource is released.
+    """
+    while True:
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            if future.cancelled():
+                raise
+
+
+async def _open_async_client(**kwargs: Any) -> httpx.AsyncClient:
+    """Build the per-evaluation ``httpx.AsyncClient`` without loading TLS trust on the loop.
+
+    The constructor resolves the certificate store synchronously, so it runs in a
+    worker thread. That await is a cancellation point: the ``aask`` deadline (or an
+    outer cancel) can fire while the worker is still inside the constructor, and
+    the thread would then hand back a client — owning the injected transport —
+    that nobody closes. So the construction is owned as a task and, once
+    cancelled, awaited and closed before the cancellation propagates.
+
+    This module has no logger by design, so a failure while building or closing
+    the abandoned client is suppressed: the cancellation is what the caller must
+    see, and letting a cleanup error replace it would swallow the cancel.
+    """
+    construction: asyncio.Task[httpx.AsyncClient] = asyncio.create_task(asyncio.to_thread(httpx.AsyncClient, **kwargs))
+    try:
+        return await asyncio.shield(construction)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            late_client = await _settle(construction)
+            await _settle(asyncio.create_task(late_client.aclose()))
+        raise
 
 
 def _read_bounded(response: httpx.Response, check_budget: Callable[[], None]) -> bytes:
